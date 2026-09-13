@@ -1,0 +1,12 @@
+# Vendored from the G.O.D runtime (github.com/gradients-ai/G.O.D, Apache-2.0, see LICENSE.md/NOTICE):
+# core/constants/datasets.py
+MIN_IMAGE_TEXT_PAIRS = 10
+MAX_IMAGE_TEXT_PAIRS = 50
+
+DPO_DEFAULT_DATASET_TYPE = "chatml.default"
+DPO_DEFAULT_FIELD_PROMPT = "question"
+DPO_DEFAULT_FIELD_SYSTEM = "system"
+DPO_DEFAULT_FIELD_CHOSEN = "chosen"
+DPO_DEFAULT_FIELD_REJECTED = "rejected"
+
+GRPO_DEFAULT_FIELD_PROMPT = "prompt"
