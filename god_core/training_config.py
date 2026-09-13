@@ -2,16 +2,18 @@
 # core/training_config.py
 import os
 
-from fiber.logging_utils import get_logger
+import logging
 
-from core.constants.datasets import DPO_DEFAULT_DATASET_TYPE
-from core.models.dataset_models import ChatTemplateDatasetType
-from core.models.dataset_models import DpoDatasetType
-from core.models.dataset_models import EnvironmentDatasetType
-from core.models.dataset_models import FileFormat
-from core.models.dataset_models import GrpoDatasetType
-from core.models.dataset_models import InstructTextDatasetType
-from core.models.dataset_models import TextDatasetType
+get_logger = lambda name=None: logging.getLogger(name or "god_core")
+
+from god_core.datasets_constants import DPO_DEFAULT_DATASET_TYPE
+from god_core.dataset_models import ChatTemplateDatasetType
+from god_core.dataset_models import DpoDatasetType
+from god_core.dataset_models import EnvironmentDatasetType
+from god_core.dataset_models import FileFormat
+from god_core.dataset_models import GrpoDatasetType
+from god_core.dataset_models import InstructTextDatasetType
+from god_core.dataset_models import TextDatasetType
 
 
 logger = get_logger(__name__)
