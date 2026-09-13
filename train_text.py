@@ -19,6 +19,7 @@ validator's held-out rows, batch pinned to 1):
 import argparse
 import json
 import os
+import random
 import sys
 import time
 
@@ -119,7 +120,7 @@ class StepClock(TrainerCallback):
         return control
 
 
-def probe_throughput(model, rows, tokenizer, batch, accum) -> float:
+def probe_throughput(model, rows, tokenizer, batch, accum, use_checkpointing=False) -> float:
     """Seconds per optimizer step in steady state on the planned shape."""
     args = TrainingArguments(
         output_dir="/tmp/probe",
@@ -135,6 +136,7 @@ def probe_throughput(model, rows, tokenizer, batch, accum) -> float:
         remove_unused_columns=False,
         bf16=True,
         tf32=True,
+        gradient_checkpointing=use_checkpointing,
     )
     collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, label_pad_token_id=-100, padding="longest")
     clock = StepClock()
@@ -144,6 +146,48 @@ def probe_throughput(model, rows, tokenizer, batch, accum) -> float:
     if len(hits) < 2:
         return 0.0
     return (hits[-1] - hits[0]) / (len(hits) - 1)  # s per optimizer step, warmup excluded
+
+
+class LengthWindowTrainer(Trainer):
+    """Batches the pre-sorted rows into TOKEN-BUDGET windows so every step sees a
+    bounded number of tokens (dynamic batch shape: long rows -> fewer per window),
+    then shuffles the WINDOW order. This kills the padding waste AND the per-step
+    overhead of batch-1 runs while keeping activations bounded."""
+
+    def __init__(self, *a, window_tokens: int = 16000, **k):
+        super().__init__(*a, **k)
+        self.window_tokens = int(window_tokens)
+        rows = self.train_dataset
+        self.windows = []
+        cur, cur_tok = [], 0
+        for i in range(len(rows)):
+            n = len(rows[i]["input_ids"])
+            if cur and cur_tok + n > self.window_tokens:
+                self.windows.append(cur)
+                cur, cur_tok = [], 0
+            cur.append(i)
+            cur_tok += n
+        if cur:
+            self.windows.append(cur)
+
+    def get_train_dataloader(self):
+        from torch.utils.data import DataLoader, Dataset
+
+        wins = self.windows
+        ns = len(wins)
+
+        class WindowDS(Dataset):
+            def __len__(self):
+                return ns
+
+            def __getitem__(self, idx):
+                return wins[idx]
+
+        def collate(batch):
+            window = batch[0] if len(batch) == 1 else [j for w in batch for j in w]
+            return self.data_collator([self.train_dataset[j] for j in window])
+
+        return DataLoader(WindowDS(), batch_size=1, shuffle=True, num_workers=2, collate_fn=collate)
 
 
 def main():
@@ -159,6 +203,8 @@ def main():
     ap.add_argument("--budget-frac", type=float, default=0.78)
     ap.add_argument("--holdout-frac", type=float, default=0.02)
     ap.add_argument("--max-epochs", type=float, default=6.0)
+    ap.add_argument("--len-window", type=int, default=0,
+                    help=">0 batches consecutive rows of the length-sorted list together (low padding)")
     args = ap.parse_args()
 
     start = time.time()
@@ -181,6 +227,23 @@ def main():
         seq_len = max_pos // 2  # the evaluator halves sequence_len the same way
 
     dt = json.loads(args.dataset_type)
+
+    if args.task_type != "InstructTextTask":
+        # DPO / GRPO / continuous-SFT (chat) run through axolotl's own training
+        # CLI configs (see task_handlers.py) - no hand-rolled loop.
+        import task_handlers
+
+        if args.task_type == "DpoTask":
+            out_dir = task_handlers.run_dpo(args.task_id, args.model, args.dataset, dt, args.file_format, args.expected_repo_name)
+        elif args.task_type == "GrpoTask":
+            out_dir = task_handlers.run_grpo(args.task_id, args.model, args.dataset, dt, args.file_format, args.expected_repo_name, args.hours_to_complete)
+        elif args.task_type == "ChatTask":
+            out_dir = task_handlers.run_chat(args.task_id, args.model, args.dataset, dt, args.file_format, args.expected_repo_name, args.hours_to_complete)
+        else:
+            sys.exit(f"Unsupported task type: {args.task_type}")
+        print(f"[mine] {args.task_type} artifact at {out_dir}")
+        return
+
     rows = load_rows(dataset_task_path(args.task_id, args.dataset, args.file_format), dt,
                      workdir, seq_len, special_tokens, tok)
     n = len(rows)
@@ -203,9 +266,12 @@ def main():
                                                  target_modules="all-linear", task_type="CAUSAL_LM"))
     print(f"[mine] params={params/1e9:.2f}B free={free_gb:.0f}GB full_ft={full_ft}", flush=True)
 
-    accum = 8
-    batch = 1
-    network_span = batch * accum  # one optimizer step sees this many rows
+    window_tokens = max(2048, int(args.len_window) * 2000) if args.len_window > 0 else 0
+    batch = (window_tokens // 1000) if args.len_window > 0 else 1  # rows/step is dynamic; token budget drives the plan
+    accum = 1 if args.len_window > 0 else 8
+    per_device = 1 if args.len_window > 0 else batch
+    mean_rows = total_tokens / max(len(train_rows), 1)
+    network_span = max(1, int(window_tokens / mean_rows)) if args.len_window > 0 else batch * accum
     collator = DataCollatorForSeq2Seq(tokenizer=tok, model=model, label_pad_token_id=-100, padding="longest")
 
     # ---- measured plan (E1-style micro-benchmark on the real shape) ----
@@ -213,7 +279,7 @@ def main():
     # so probing the shortest rows underestimates throughput several-fold
     _mid = len(train_rows) // 2
     probe_rows = train_rows[max(0, _mid - network_span * PROBE_STEPS): _mid + 1]
-    step_s = probe_throughput(model, probe_rows, tok, batch, accum)
+    step_s = probe_throughput(model, probe_rows, tok, batch, accum, use_checkpointing=(args.len_window > 0))
     probe_s = time.time() - start
     budget_s = args.hours_to_complete * 3600.0 * args.budget_frac
     left_s = max(60.0, budget_s - probe_s)
@@ -229,7 +295,7 @@ def main():
     targs = TrainingArguments(
         output_dir=os.path.join(workdir, "ckpt"),
         max_steps=max_steps,
-        per_device_train_batch_size=batch,
+        per_device_train_batch_size=per_device,
         per_device_eval_batch_size=8,
         gradient_accumulation_steps=accum,
         learning_rate=(2e-5 if full_ft else 4e-4),
@@ -246,13 +312,15 @@ def main():
         greater_is_better=False,
         bf16=True,
         tf32=True,
-        gradient_checkpointing=(not full_ft),
+        gradient_checkpointing=((not full_ft) or args.len_window > 0),
         dataloader_num_workers=2,
         report_to=[],
         remove_unused_columns=False,
     )
-    trainer = Trainer(model=model, args=targs, train_dataset=train_rows, eval_dataset=eval_rows,
-                      data_collator=collator, callbacks=[HardStop(start + args.hours_to_complete * 3600.0)])
+    trainer_kwargs = dict(window_tokens=window_tokens) if args.len_window > 0 else {}
+    trainer_cls = LengthWindowTrainer if args.len_window > 0 else Trainer
+    trainer = trainer_cls(model=model, args=targs, train_dataset=train_rows, eval_dataset=eval_rows,
+                          data_collator=collator, callbacks=[HardStop(start + args.hours_to_complete * 3600.0)], **trainer_kwargs)
     remove_sampler_seeding = None
     trainer.train()
 
