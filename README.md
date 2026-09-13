@@ -29,3 +29,12 @@ Requirements honoured: no internet access from the container, `/cache` read-only
 model from `/cache/models/{model}`, task rows from `/cache/datasets/{task_id}_train_data.json`,
 output `/app/checkpoints/{task_id}/{expected_repo_name}`, `max_position_embeddings`
 never decreased.
+
+## Task-type coverage
+- **InstructTextTask**: the custom HF-Trainer path (eval-parity axolotl data, measured time plan,
+  best-checkpoint restore by holdout, full bf16 FT when it fits, LoRA fallback above that).
+  Batch shape: 1 x grad-accumulation 8 (measured best on the official task); optional
+  token-budget windowed batches via `--len-window` (keep the default unless measured better).
+- **DpoTask / GrpoTask / ChatTask**: dispatched to axolotl's own training CLI
+  (`accelerate launch -m axolotl.cli.train`) with configs built from the standardized task
+  arguments - task_handlers.py. No hand-rolled loop anywhere.
