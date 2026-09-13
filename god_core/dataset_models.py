@@ -5,8 +5,8 @@ from enum import Enum
 from pydantic import BaseModel
 from pydantic import Field
 
-from core.constants.environments import EnvironmentName
-from core.models.reward_models import RewardFunction
+from god_core.environments import EnvironmentName
+from god_core.reward_models import RewardFunction
 
 
 class FileFormat(str, Enum):
