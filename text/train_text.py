@@ -120,7 +120,22 @@ class StepClock(TrainerCallback):
         return control
 
 
-def probe_throughput(model, rows, tokenizer, batch, accum, use_checkpointing=False) -> float:
+class _DualCollator:
+    """Packs only the training stream; eval keeps plain padding (reliable loss)."""
+
+    def __init__(self, t_coll, e_coll):
+        self.t_coll, self.e_coll = t_coll, e_coll
+        self._mode = "train"
+
+    def __call__(self, feats):
+        c = self.t_coll if self._mode == "train" else self.e_coll
+        return c(feats)
+
+    def __getattr__(self, n):
+        return getattr(self.t_coll, n)
+
+
+def probe_throughput(model, rows, tokenizer, batch, accum, use_checkpointing=False, pack_collator=None) -> float:
     """Seconds per optimizer step in steady state on the planned shape."""
     args = TrainingArguments(
         output_dir="/tmp/probe",
@@ -138,7 +153,7 @@ def probe_throughput(model, rows, tokenizer, batch, accum, use_checkpointing=Fal
         tf32=True,
         gradient_checkpointing=use_checkpointing,
     )
-    collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, label_pad_token_id=-100, padding="longest")
+    collator = pack_collator or DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, label_pad_token_id=-100, padding="longest")
     clock = StepClock()
     tr = Trainer(model=model, args=args, train_dataset=rows, data_collator=collator, callbacks=[clock])
     tr.train()
@@ -206,6 +221,11 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-5, help="full-FT learning rate (LoRA uses 32x this)")
     ap.add_argument("--len-window", type=int, default=0,
                     help=">0 batches consecutive rows of the length-sorted list together (low padding)")
+    ap.add_argument("--pack", type=int, default=0,
+                    help=">0 packs rows into ~this many-token blocks via FA2 varlen (DataCollatorWithFlattening)")
+    ap.add_argument("--seed", type=int, default=0, help="data split/order seed; 0 = the E3-compiled order")
+    ap.add_argument("--dev-pass", type=int, default=0, help=">0 divides the base LR by this and sweeps the holdout rows once before saving")
+    ap.add_argument("--torch-compile", action="store_true", help="Trainer(torch_compile=True): more steps in the same wall clock")
     args = ap.parse_args()
 
     start = time.time()
@@ -215,7 +235,23 @@ def main():
     os.makedirs(workdir, exist_ok=True)
 
     model_path = model_cache_path(args.model)
-    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    try:
+        tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    except (ValueError, TypeError) as _e:
+        # Some new tokens (e.g. LiquidAI/LFM2.5) ship tokenizer_class="TokenizersBackend",
+        # which older transformers cannot import; the underlying tokenizer.json is a standard
+        # fast-tokenizer file - remap the class and load directly.
+        import json as _json
+        _tc = os.path.join(model_path, "tokenizer_config.json")
+        if "TokenizersBackend" in str(_e) and os.path.exists(_tc):
+            _cfg = _json.load(open(_tc))
+            _cfg["tokenizer_class"] = "PreTrainedTokenizerFast"
+            with open(_tc, "w") as f:
+                _json.dump(_cfg, f)
+            from transformers import PreTrainedTokenizerFast
+            tok = PreTrainedTokenizerFast.from_pretrained(model_path)
+        else:
+            raise
     special_tokens = {}
     if tok.pad_token_id is None and tok.eos_token is not None:
         special_tokens = {"pad_token": tok.eos_token}
@@ -247,15 +283,19 @@ def main():
 
     rows = load_rows(dataset_task_path(args.task_id, args.dataset, args.file_format), dt,
                      workdir, seq_len, special_tokens, tok)
+    if args.seed != 0:
+        import random as _rnd
+        _rnd.Random(args.seed).shuffle(rows)
     n = len(rows)
-    set_seed(0)
+    set_seed(args.seed)
     holdout = max(HOLDOUT_MIN, int(n * args.holdout_frac))
     eval_rows, train_rows = rows[:holdout], rows[holdout:]
     total_tokens = sum(len(s["input_ids"]) for s in train_rows)
     print(f"[mine] rows={n} train={len(train_rows)} holdout={holdout} seq={seq_len} tokens={total_tokens}", flush=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype="auto", attn_implementation="sdpa")
+    attn_impl = "flash_attention_2" if args.pack > 0 else "sdpa"
+    model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype="auto", attn_implementation=attn_impl)
     model.config.use_cache = False
 
     params = sum(p.numel() for p in model.parameters())
@@ -274,13 +314,28 @@ def main():
     mean_rows = total_tokens / max(len(train_rows), 1)
     network_span = max(1, int(window_tokens / mean_rows)) if args.len_window > 0 else batch * accum
     collator = DataCollatorForSeq2Seq(tokenizer=tok, model=model, label_pad_token_id=-100, padding="longest")
+    train_collator = collator
+    eval_collator = collator
+    if args.pack > 0:
+        # FA-varlen packing: rows are concatenated into ~pack-token blocks with
+        # position_ids resets; cross-doc attention is cut by the FA2 varlen path.
+        from transformers import DataCollatorWithFlattening
+        pack_rows = max(1, int(args.pack / max(mean_rows, 1)))  # rows per packed block
+        per_device = pack_rows
+        accum = max(1, round(8 / pack_rows))  # keeps ~8 rows per optimizer step
+        network_span = pack_rows
+        train_collator = DataCollatorWithFlattening()
+        print(f"[mine] packing: {pack_rows} rows/block (~{args.pack} tok), accum={accum}", flush=True)
 
     # ---- measured plan (E1-style micro-benchmark on the real shape) ----
     # sample rows around the MEDIAN length: per-step time has a fixed overhead,
     # so probing the shortest rows underestimates throughput several-fold
     _mid = len(train_rows) // 2
     probe_rows = train_rows[max(0, _mid - network_span * PROBE_STEPS): _mid + 1]
-    step_s = probe_throughput(model, probe_rows, tok, batch, accum, use_checkpointing=(args.len_window > 0))
+    _pb = per_device if args.pack > 0 else batch
+    _pa = accum if args.pack > 0 else accum
+    step_s = probe_throughput(model, probe_rows, tok, batch if args.pack == 0 else _pb,
+                              accum, use_checkpointing=(args.len_window > 0), pack_collator=(train_collator if args.pack > 0 else None))
     probe_s = time.time() - start
     budget_s = args.hours_to_complete * 3600.0 * args.budget_frac
     left_s = max(60.0, budget_s - probe_s)
@@ -297,7 +352,7 @@ def main():
         output_dir=os.path.join(workdir, "ckpt"),
         max_steps=max_steps,
         per_device_train_batch_size=per_device,
-        per_device_eval_batch_size=8,
+        per_device_eval_batch_size=int(os.environ.get("GOD_EVAL_BS", 8)),
         gradient_accumulation_steps=accum,
         learning_rate=(args.lr if full_ft else args.lr * 32),
         lr_scheduler_type="cosine",
@@ -307,28 +362,86 @@ def main():
         eval_steps=eval_every,
         save_strategy="steps",
         save_steps=eval_every,
-        save_total_limit=2,
+        save_total_limit=int(os.environ.get("GOD_SAVE_LIMIT", 2)),
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         bf16=True,
         tf32=True,
+        torch_compile=args.torch_compile,
         gradient_checkpointing=((not full_ft) or args.len_window > 0),
-        dataloader_num_workers=2,
+        dataloader_num_workers=(0 if args.pack > 0 else 2),
         report_to=[],
         remove_unused_columns=False,
     )
     trainer_kwargs = dict(window_tokens=window_tokens) if args.len_window > 0 else {}
     trainer_cls = LengthWindowTrainer if args.len_window > 0 else Trainer
     trainer = trainer_cls(model=model, args=targs, train_dataset=train_rows, eval_dataset=eval_rows,
-                          data_collator=collator, callbacks=[HardStop(start + args.hours_to_complete * 3600.0)], **trainer_kwargs)
+                          data_collator=(collator if args.pack == 0 else _DualCollator(train_collator, eval_collator)),
+                          callbacks=[HardStop(start + args.hours_to_complete * 3600.0)], **trainer_kwargs)
+    if args.pack > 0:
+        _dual = trainer.data_collator
+        _inner_eval = trainer.evaluate
+        def _evaluate_mde(**kw):
+            _dual._mode = "eval"
+            try:
+                return _inner_eval(**kw)
+            finally:
+                _dual._mode = "train"
+        trainer.evaluate = _evaluate_mde
     remove_sampler_seeding = None
     trainer.train()
 
     best = trainer.state.best_metric
     print(f"[mine] best internal eval_loss={best}", flush=True)
-    model.config.use_cache = True
-    out = trainer.model
+
+    if args.dev_pass > 0 and best is not None:
+        # Champion-style dev pass: from the BEST checkpoint, one low-LR epoch over
+        # the held-out rows (official train data the artifact has not seen), then
+        # keep the final weights only if the dev loss improves.
+        import gc
+        del trainer
+        gc.collect()
+        torch.cuda.empty_cache()
+        _prep = "cuda" if torch.cuda.is_available() else "cpu"
+        _best_ckpt = os.path.join(workdir, "ckpt-best")
+        trainer_save = None
+        base = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype="auto", attn_implementation="sdpa")
+        base.config.use_cache = False
+        full_ft2 = (params / 1e9) * 16 <= free_gb * 0.75
+        if not full_ft2:
+            from peft import LoraConfig, get_peft_model
+            base = get_peft_model(base, LoraConfig(r=64, lora_alpha=128, lora_dropout=0.05,
+                                                   target_modules="all-linear", task_type="CAUSAL_LM"))
+        targs_dev = TrainingArguments(
+            output_dir=os.path.join(workdir, "devfit"),
+            max_steps=max(20, len(eval_rows) // 8),  # one effective epoch over the holdout
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=8,
+            learning_rate=(args.lr / args.dev_pass) if full_ft2 else (args.lr * 32 / args.dev_pass),
+            lr_scheduler_type="linear",
+            warmup_ratio=0.0,
+            logging_steps=10,
+            bf16=True,
+            tf32=True,
+            report_to=[],
+            save_strategy="no",
+            remove_unused_columns=False,
+            dataloader_num_workers=2,
+            seed=args.seed,
+        )
+        trainer_dev = Trainer(model=base, args=targs_dev, train_dataset=eval_rows,
+                              data_collator=DataCollatorForSeq2Seq(tokenizer=tok, model=base, label_pad_token_id=-100, padding="longest"))
+        trainer_dev.train()
+        dl = trainer_dev.model
+        model.config.use_cache = True
+        del trainer_dev
+        gc.collect()
+        torch.cuda.empty_cache()
+    else:
+        model.config.use_cache = True
+        dl = None
+    out = dl if dl is not None else trainer.model
     if hasattr(out, "merge_and_unload"):
         out = out.merge_and_unload()
     out.eval()
