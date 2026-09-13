@@ -51,6 +51,23 @@ def model_cache_path(model_id: str) -> str:
     return os.path.join(CACHE, "models", model_id.replace("/", "--"))
 
 
+def ensure_loadable_tokenizer(model_dir: str) -> None:
+    """Idempotent: remap TokenizersBackend (transformers-5-only class) to
+    PreTrainedTokenizerFast so the axolotl container (transformers <5) can load
+    new-family tokenizers (e.g. LiquidAI/LFM2.5). The standard tokenizer.json
+    underneath is what actually loads."""
+    tc = os.path.join(model_dir, "tokenizer_config.json")
+    try:
+        with open(tc) as f:
+            cfg = json.load(f)
+        if cfg.get("tokenizer_class") == "TokenizersBackend":
+            cfg["tokenizer_class"] = "PreTrainedTokenizerFast"
+            with open(tc, "w") as f:
+                json.dump(cfg, f)
+    except FileNotFoundError:
+        pass
+
+
 def _config_path(task_id: str) -> str:
     d = os.path.join(CACHE, "run", task_id, "configs")
     os.makedirs(d, exist_ok=True)
@@ -93,8 +110,10 @@ def run_dpo(task_id: str, model: str, dataset: str, dataset_type_dict: dict, fil
     rows_file = _stage_rows(dataset_task_path(task_id, dataset, file_format), workdir)
     out_dir = os.path.join(CHECKPOINTS, task_id, expected_repo_name)
 
+    _mp = model_cache_path(model)
+    ensure_loadable_tokenizer(_mp)
     cfg = dict(DPO_BASE)
-    cfg["base_model"] = model_cache_path(model)
+    cfg["base_model"] = _mp
     cfg["rl"] = "dpo"
     cfg["datasets"] = [{
         # NOTE: axolotl resolves `data_files` relative to the process CWD, not `path` (verified in both
@@ -145,8 +164,10 @@ def run_grpo(task_id: str, model: str, dataset: str, dataset_type_dict: dict, fi
     if not fqns and dt.reward_functions is not None:
         raise ValueError("GrpoTask requires at least one reward function")
 
+    _mp = model_cache_path(model)
+    ensure_loadable_tokenizer(_mp)
     cfg = dict(GRPO_BASE)
-    cfg["base_model"] = model_cache_path(model)
+    cfg["base_model"] = _mp
     cfg["rl"] = "grpo"
     cfg["datasets"] = [{
         "path": rows_file, "ds_type": "json", "split": "train", "field": dt.field_prompt,
@@ -182,8 +203,10 @@ def run_chat(task_id: str, model: str, dataset: str, dataset_type_dict: dict, fi
     rows_file = _stage_rows(dataset_task_path(task_id, dataset, file_format), workdir)
     out_dir = os.path.join(CHECKPOINTS, task_id, expected_repo_name)
 
+    _mp = model_cache_path(model)
+    ensure_loadable_tokenizer(_mp)
     cfg = dict(DPO_BASE)
-    cfg["base_model"] = model_cache_path(model)
+    cfg["base_model"] = _mp
     cfg["datasets"] = [{
         "path": rows_file, "ds_type": "json", "split": "train",
         "type": "chat_template",
