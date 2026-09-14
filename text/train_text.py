@@ -215,8 +215,11 @@ def main():
     ap.add_argument("--file-format", required=True)
     ap.add_argument("--hours-to-complete", type=float, required=True)
     ap.add_argument("--expected-repo-name", required=True)
-    ap.add_argument("--budget-frac", type=float, default=0.78)
-    ap.add_argument("--holdout-frac", type=float, default=0.02)
+    ap.add_argument("--budget-frac", type=float, default=0.92)
+    ap.add_argument("--holdout-frac", type=float, default=0.005)
+    ap.add_argument("--warmup-ratio", type=float, default=0.03)
+    ap.add_argument("--weight-decay", type=float, default=0.0)
+    ap.add_argument("--adam-beta2", type=float, default=0.999)
     ap.add_argument("--max-epochs", type=float, default=6.0)
     ap.add_argument("--lr", type=float, default=2e-5, help="full-FT learning rate (LoRA uses 32x this)")
     ap.add_argument("--len-window", type=int, default=0,
@@ -225,6 +228,9 @@ def main():
                     help=">0 packs rows into ~this many-token blocks via FA2 varlen (DataCollatorWithFlattening)")
     ap.add_argument("--seed", type=int, default=0, help="data split/order seed; 0 = the E3-compiled order")
     ap.add_argument("--dev-pass", type=int, default=0, help=">0 divides the base LR by this and sweeps the holdout rows once before saving")
+    ap.add_argument("--min-lr-rate", type=float, default=0.25, help=">0 switches the schedule to cosine_with_min_lr with this floor fraction")
+    ap.add_argument("--liger", action="store_true", help="Liger fused CE (no logits spike) + per_device=batch_rows rows (single lever with --rows)")
+    ap.add_argument("--rows", type=int, default=8, help="rows per optimizer step at --lr-batch (with --liger: per-device rows, accum 1)")
     ap.add_argument("--torch-compile", action="store_true", help="Trainer(torch_compile=True): more steps in the same wall clock")
     args = ap.parse_args()
 
@@ -296,6 +302,12 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     attn_impl = "flash_attention_2" if args.pack > 0 else "sdpa"
     model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype="auto", attn_implementation=attn_impl)
+    if args.liger:
+        # Post-load class patch: the fused CE swaps gemma2's forward AFTER the
+        # pristine classes have already initialized the weights (the Auto-Liger
+        # load path collides with transformers 4.53's gemma2 _init_weights).
+        from liger_kernel.transformers import apply_liger_kernel_to_gemma2
+        apply_liger_kernel_to_gemma2(fused_linear_cross_entropy=True, cross_entropy=False, rms_norm=True, geglu=True)
     model.config.use_cache = False
 
     params = sum(p.numel() for p in model.parameters())
@@ -311,6 +323,11 @@ def main():
     batch = (window_tokens // 1000) if args.len_window > 0 else 1  # rows/step is dynamic; token budget drives the plan
     accum = 1 if args.len_window > 0 else 8
     per_device = 1 if args.len_window > 0 else batch
+    if args.liger:
+        # Liger fused CE: one forward per optimizer step holds rows' logits
+        # without materializing them; the shape that killed E4 becomes safe.
+        per_device = max(1, args.rows)
+        accum = 1
     mean_rows = total_tokens / max(len(train_rows), 1)
     network_span = max(1, int(window_tokens / mean_rows)) if args.len_window > 0 else batch * accum
     collator = DataCollatorForSeq2Seq(tokenizer=tok, model=model, label_pad_token_id=-100, padding="longest")
@@ -343,7 +360,7 @@ def main():
     epoch_steps = max(1, len(train_rows) // network_span)
     fit_steps = int(left_s / max(step_s, 1e-6)) if step_s else PROBE_STEPS
     max_steps = max(PROBE_STEPS, min(fit_steps, int(epoch_steps * args.max_epochs)))
-    eval_every = max(20, min(400, max_steps // 8))
+    eval_every = max(20, min(int(os.environ.get("GOD_EVAL_EVERY", 500)), max_steps // 8))
     tps = (mean_tokens * network_span) / step_s if step_s else 0.0
     print(f"[mine] probe {tps:.0f} tok/s in {probe_s:.0f}s -> max_steps={max_steps} "
           f"(epochs={max_steps/epoch_steps:.2f}, eval every {eval_every})", flush=True)
@@ -355,8 +372,11 @@ def main():
         per_device_eval_batch_size=int(os.environ.get("GOD_EVAL_BS", 8)),
         gradient_accumulation_steps=accum,
         learning_rate=(args.lr if full_ft else args.lr * 32),
-        lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
+        lr_scheduler_type=("cosine_with_min_lr" if args.min_lr_rate > 0 else "cosine"),
+        lr_scheduler_kwargs={"min_lr_rate": args.min_lr_rate} if args.min_lr_rate > 0 else None,
+        warmup_ratio=args.warmup_ratio,
+        weight_decay=args.weight_decay,
+        adam_beta2=args.adam_beta2,
         logging_steps=20,
         eval_strategy="steps",
         eval_steps=eval_every,
